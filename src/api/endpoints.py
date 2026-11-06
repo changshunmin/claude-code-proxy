@@ -9,7 +9,10 @@ from src.core.logging import logger
 from src.core.client import OpenAIClient
 from src.core.errors import anthropic_error_body, prompt_too_long_message
 from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
-from src.conversion.request_converter import convert_claude_to_openai
+from src.conversion.request_converter import (
+    convert_claude_to_openai,
+    estimate_claude_token_count,
+)
 from src.conversion.response_converter import (
     convert_openai_to_claude_response,
     convert_openai_streaming_to_claude_with_cancellation,
@@ -137,34 +140,9 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
 @router.post("/v1/messages/count_tokens")
 async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(validate_api_key)):
     try:
-        # For token counting, we'll use a simple estimation
-        # In a real implementation, you might want to use tiktoken or similar
-
-        total_chars = 0
-
-        # Count system message characters
-        if request.system:
-            if isinstance(request.system, str):
-                total_chars += len(request.system)
-            elif isinstance(request.system, list):
-                for block in request.system:
-                    if hasattr(block, "text"):
-                        total_chars += len(block.text)
-
-        # Count message characters
-        for msg in request.messages:
-            if msg.content is None:
-                continue
-            elif isinstance(msg.content, str):
-                total_chars += len(msg.content)
-            elif isinstance(msg.content, list):
-                for block in msg.content:
-                    if hasattr(block, "text") and block.text is not None:
-                        total_chars += len(block.text)
-
-        # Rough estimation: 4 characters per token
-        estimated_tokens = max(1, total_chars // 4)
-
+        estimated_tokens = estimate_claude_token_count(
+            request.system, request.messages, request.tools
+        )
         return {"input_tokens": estimated_tokens}
 
     except Exception as e:

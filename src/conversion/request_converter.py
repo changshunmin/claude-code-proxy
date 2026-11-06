@@ -8,14 +8,15 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _text_tokens(text: str) -> int:
-    """Approximate tokenizer cost: common CJK runs about 0.5 tokens per
-    character, latin/code about one per four (measured against the upstream)."""
+def estimate_text_tokens(text: str) -> int:
+    """Approximate tokenizer cost: CJK at one token per character (conservative —
+    undercounting risks overflowing the upstream window), latin/code at four
+    characters per token."""
     cjk = 0
     for ch in text:
         if "一" <= ch <= "鿿" or "぀" <= ch <= "ヿ" or "가" <= ch <= "힯":
             cjk += 1
-    return (cjk * 3) // 5 + (len(text) - cjk) // 4
+    return cjk + (len(text) - cjk) // 4
 
 
 def estimate_tokens(messages: List[Dict[str, Any]]) -> int:
@@ -24,12 +25,96 @@ def estimate_tokens(messages: List[Dict[str, Any]]) -> int:
     for msg in messages:
         content = msg.get("content")
         if isinstance(content, str):
-            total += _text_tokens(content)
+            total += estimate_text_tokens(content)
         elif isinstance(content, list):
             for block in content:
                 if isinstance(block, dict):
-                    total += _text_tokens(json.dumps(block, ensure_ascii=False))
+                    total += estimate_text_tokens(json.dumps(block, ensure_ascii=False))
     return total
+
+
+def _block_field(block, name, default=None):
+    """Read a block field from either a pydantic model or a raw dict."""
+    if isinstance(block, dict):
+        return block.get(name, default)
+    return getattr(block, name, default)
+
+
+def estimate_claude_token_count(system, messages, tools=None) -> int:
+    """CJK-aware estimate for the /v1/messages/count_tokens endpoint.
+
+    The upstream has no tokenizer endpoint, so this stays an estimate — but it
+    counts CJK honestly and includes tool schemas, unlike a flat 4-chars/token.
+    Images and redacted thinking are skipped: their payloads are base64 and
+    would wildly inflate the count.
+    """
+    total = 0
+
+    def add(text):
+        nonlocal total
+        if text:
+            total += estimate_text_tokens(str(text))
+
+    def add_content(content):
+        if content is None:
+            return
+        if isinstance(content, str):
+            add(content)
+            return
+        if isinstance(content, dict):
+            add(json.dumps(content, ensure_ascii=False))
+            return
+        if not isinstance(content, list):
+            return
+        for block in content:
+            btype = _block_field(block, "type")
+            if btype == Constants.CONTENT_TEXT:
+                add(_block_field(block, "text"))
+            elif btype == Constants.CONTENT_THINKING:
+                add(_block_field(block, "thinking"))
+            elif btype == Constants.CONTENT_TOOL_USE:
+                add(_block_field(block, "name"))
+                add(json.dumps(_block_field(block, "input", {}) or {}, ensure_ascii=False))
+            elif btype == Constants.CONTENT_TOOL_RESULT:
+                inner = _block_field(block, "content")
+                if isinstance(inner, list):
+                    for item in inner:
+                        itype = _block_field(item, "type")
+                        if itype == Constants.CONTENT_TEXT:
+                            add(_block_field(item, "text"))
+                        elif itype in (Constants.CONTENT_IMAGE, "image"):
+                            continue
+                        elif isinstance(item, dict):
+                            add(json.dumps(item, ensure_ascii=False))
+                elif isinstance(inner, str):
+                    add(inner)
+                elif inner is not None:
+                    add(json.dumps(inner, ensure_ascii=False))
+            elif btype in (Constants.CONTENT_IMAGE, Constants.CONTENT_REDACTED_THINKING):
+                continue
+            elif isinstance(block, dict):
+                add(json.dumps(block, ensure_ascii=False))
+
+    add_content(system)
+    for msg in messages:
+        add_content(_block_field(msg, "content"))
+
+    for tool in tools or []:
+        if isinstance(tool, dict):
+            add(json.dumps(tool, ensure_ascii=False))
+        else:
+            add(
+                json.dumps(
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": tool.input_schema,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+    return max(1, total)
 
 
 def resolve_max_tokens(
@@ -150,9 +235,6 @@ def convert_claude_to_openai(
     }
 
     apply_thinking_config(openai_request, claude_request)
-    logger.debug(
-        f"Converted Claude request to OpenAI format: {json.dumps(openai_request, indent=2, ensure_ascii=False)}"
-    )
     # Add optional parameters
     if claude_request.stop_sequences:
         openai_request["stop"] = claude_request.stop_sequences
@@ -183,7 +265,10 @@ def convert_claude_to_openai(
         if choice_type == "auto":
             openai_request["tool_choice"] = "auto"
         elif choice_type == "any":
-            openai_request["tool_choice"] = "auto"
+            # Claude's "any" requires some tool call; OpenAI spells it "required"
+            openai_request["tool_choice"] = "required"
+        elif choice_type == "none":
+            openai_request["tool_choice"] = "none"
         elif choice_type == "tool" and "name" in claude_request.tool_choice:
             openai_request["tool_choice"] = {
                 "type": Constants.TOOL_FUNCTION,
@@ -192,6 +277,9 @@ def convert_claude_to_openai(
         else:
             openai_request["tool_choice"] = "auto"
 
+    logger.debug(
+        f"Converted Claude request to OpenAI format: {json.dumps(openai_request, indent=2, ensure_ascii=False)}"
+    )
     return openai_request
 
 
@@ -284,58 +372,79 @@ def convert_claude_assistant_message(msg: ClaudeMessage) -> Dict[str, Any]:
 
 
 def convert_claude_tool_results(msg: ClaudeMessage) -> List[Dict[str, Any]]:
-    """Convert Claude tool results to OpenAI format."""
+    """Convert Claude tool results to OpenAI format.
+
+    OpenAI tool messages only carry text, so image blocks returned by tools
+    (e.g. the Read tool) are re-attached as a follow-up user message with
+    image_url blocks. Serializing them into the tool text instead would make
+    the upstream tokenize the raw base64 (~1.45 chars/token).
+    """
     tool_messages = []
+    images = []
 
     if isinstance(msg.content, list):
         for block in msg.content:
             if block.type == Constants.CONTENT_TOOL_RESULT:
-                content = parse_tool_result_content(block.content)
+                text, image_blocks = parse_tool_result_content(block.content)
+                if image_blocks and not text:
+                    text = "[image attached in the following message]"
                 tool_messages.append(
                     {
                         "role": Constants.ROLE_TOOL,
                         "tool_call_id": block.tool_use_id,
-                        "content": content,
+                        "content": text,
                     }
                 )
+                images.extend(image_blocks)
+
+    if images:
+        tool_messages.append({"role": Constants.ROLE_USER, "content": images})
 
     return tool_messages
 
 
 def parse_tool_result_content(content):
-    """Parse and normalize tool result content into a string format."""
+    """Split tool result content into (text, image_url blocks)."""
     if content is None:
-        return "No content provided"
+        return "No content provided", []
 
     if isinstance(content, str):
-        return content
-
-    if isinstance(content, list):
-        result_parts = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == Constants.CONTENT_TEXT:
-                result_parts.append(item.get("text", ""))
-            elif isinstance(item, str):
-                result_parts.append(item)
-            elif isinstance(item, dict):
-                if "text" in item:
-                    result_parts.append(item.get("text", ""))
-                else:
-                    try:
-                        result_parts.append(json.dumps(item, ensure_ascii=False))
-                    except:
-                        result_parts.append(str(item))
-        return "\n".join(result_parts).strip()
+        return content, []
 
     if isinstance(content, dict):
-        if content.get("type") == Constants.CONTENT_TEXT:
-            return content.get("text", "")
-        try:
-            return json.dumps(content, ensure_ascii=False)
-        except:
-            return str(content)
+        content = [content]
 
-    try:
-        return str(content)
-    except:
-        return "Unparseable content"
+    if not isinstance(content, list):
+        return str(content), []
+
+    result_parts = []
+    images = []
+    for item in content:
+        if isinstance(item, str):
+            result_parts.append(item)
+        elif isinstance(item, dict) and item.get("type") == Constants.CONTENT_IMAGE:
+            source = item.get("source") or {}
+            if source.get("type") == "base64" and source.get("data"):
+                media_type = source.get("media_type") or "image/png"
+                images.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{media_type};base64,{source['data']}"
+                        },
+                    }
+                )
+        elif isinstance(item, dict):
+            if item.get("type") == Constants.CONTENT_TEXT:
+                result_parts.append(item.get("text", ""))
+            elif "text" in item:
+                result_parts.append(item.get("text", ""))
+            else:
+                try:
+                    result_parts.append(json.dumps(item, ensure_ascii=False))
+                except Exception:
+                    result_parts.append(str(item))
+        else:
+            result_parts.append(str(item))
+
+    return "\n".join(part for part in result_parts if part).strip(), images
