@@ -1,12 +1,79 @@
 import json
-from typing import Dict, Any, List
-from venv import logger
+from typing import Dict, Any, List, Optional
 from src.core.constants import Constants
 from src.models.claude import ClaudeMessagesRequest, ClaudeMessage
 from src.core.config import config
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _text_tokens(text: str) -> int:
+    """Approximate tokenizer cost: CJK runs about one token per character,
+    latin text about one per four."""
+    cjk = 0
+    for ch in text:
+        if "一" <= ch <= "鿿" or "぀" <= ch <= "ヿ" or "가" <= ch <= "힯":
+            cjk += 1
+    return cjk + (len(text) - cjk) // 4
+
+
+def estimate_tokens(messages: List[Dict[str, Any]]) -> int:
+    """Rough token estimate used only to keep prompt + output inside the window."""
+    total = 0
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, str):
+            total += _text_tokens(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    total += _text_tokens(json.dumps(block, ensure_ascii=False))
+    return total
+
+
+def resolve_max_tokens(
+    claude_request: ClaudeMessagesRequest, openai_messages: List[Dict[str, Any]]
+) -> int:
+    """Clamp the requested output size to both the output cap and the model window."""
+    requested = max(claude_request.max_tokens, config.min_tokens_limit)
+    limit = min(requested, config.max_tokens_limit, config.model_max_output)
+
+    remaining = config.model_max_context - estimate_tokens(openai_messages)
+    # Leave headroom so the estimate being off does not trip the upstream 400
+    safe_remaining = max(config.min_tokens_limit, remaining - 2048)
+    return min(limit, safe_remaining)
+
+
+def apply_thinking_config(
+    openai_request: Dict[str, Any], claude_request: ClaudeMessagesRequest
+) -> None:
+    """Translate Claude's thinking/effort request into the upstream's controls."""
+    thinking = claude_request.thinking
+    wants_thinking = thinking is not None and (thinking.type or "").lower() not in (
+        "disabled",
+        "off",
+        "none",
+    )
+    if thinking is not None and thinking.type is None:
+        # Legacy shape: {"thinking": {"enabled": true}}
+        wants_thinking = True
+
+    # The OpenAI SDK rejects unknown keyword arguments, so vendor-specific
+    # fields have to ride in `extra_body` to reach the request JSON.
+    extra_body = openai_request.setdefault("extra_body", {})
+
+    if config.thinking_mode == "off" or not wants_thinking:
+        extra_body["chat_template_kwargs"] = {"thinking": False}
+        return
+
+    effort = config.resolve_effort(
+        claude_request.output_config.effort if claude_request.output_config else None
+    )
+    if effort == "none":
+        extra_body["chat_template_kwargs"] = {"thinking": False}
+        return
+    extra_body["reasoning_effort"] = effort
 
 
 def convert_claude_to_openai(
@@ -77,13 +144,12 @@ def convert_claude_to_openai(
     openai_request = {
         "model": openai_model,
         "messages": openai_messages,
-        "max_tokens": min(
-            max(claude_request.max_tokens, config.min_tokens_limit),
-            config.max_tokens_limit,
-        ),
+        "max_tokens": resolve_max_tokens(claude_request, openai_messages),
         "temperature": claude_request.temperature,
         "stream": claude_request.stream,
     }
+
+    apply_thinking_config(openai_request, claude_request)
     logger.debug(
         f"Converted Claude request to OpenAI format: {json.dumps(openai_request, indent=2, ensure_ascii=False)}"
     )
@@ -169,16 +235,21 @@ def convert_claude_assistant_message(msg: ClaudeMessage) -> Dict[str, Any]:
     """Convert Claude assistant message to OpenAI format."""
     text_parts = []
     tool_calls = []
+    reasoning_parts = []
 
     if msg.content is None:
         return {"role": Constants.ROLE_ASSISTANT, "content": None}
-    
+
     if isinstance(msg.content, str):
         return {"role": Constants.ROLE_ASSISTANT, "content": msg.content}
 
     for block in msg.content:
         if block.type == Constants.CONTENT_TEXT:
             text_parts.append(block.text)
+        elif block.type == Constants.CONTENT_THINKING:
+            # Upstream takes prior reasoning back as a flat `reasoning` field
+            if block.thinking:
+                reasoning_parts.append(block.thinking)
         elif block.type == Constants.CONTENT_TOOL_USE:
             tool_calls.append(
                 {
@@ -198,6 +269,12 @@ def convert_claude_assistant_message(msg: ClaudeMessage) -> Dict[str, Any]:
         openai_message["content"] = "".join(text_parts)
     else:
         openai_message["content"] = None
+
+    if reasoning_parts:
+        openai_message["reasoning"] = "".join(reasoning_parts)
+        if openai_message["content"] is None and not tool_calls:
+            # An assistant turn that only thought would otherwise look empty
+            openai_message["content"] = ""
 
     # Set tool calls
     if tool_calls:

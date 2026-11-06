@@ -145,6 +145,13 @@ venv.bak/
 # mypy
 .mypy_cache/
 .dmypy.json
+
+# Local relay secrets, backups and runtime artifacts
+.env.bak*
+*.bak
+*.bak.*
+*.pid
+/vi
 dmypy.json
 
 # Pyre type checker

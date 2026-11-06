@@ -1,5 +1,6 @@
 import os
 import sys
+from typing import Optional
 
 # Configuration
 class Config:
@@ -20,15 +21,44 @@ class Config:
         self.log_level = os.environ.get("LOG_LEVEL", "INFO")
         self.max_tokens_limit = int(os.environ.get("MAX_TOKENS_LIMIT", "4096"))
         self.min_tokens_limit = int(os.environ.get("MIN_TOKENS_LIMIT", "100"))
-        
+
+        # Total window (input + output) of the upstream model
+        self.model_max_context = int(os.environ.get("MODEL_MAX_CONTEXT", "262144"))
+        # Hard cap on completion tokens; also clamped by model_max_context - prompt
+        self.model_max_output = int(os.environ.get("MODEL_MAX_OUTPUT", str(self.max_tokens_limit)))
+
         # Connection settings
         self.request_timeout = int(os.environ.get("REQUEST_TIMEOUT", "90"))
         self.max_retries = int(os.environ.get("MAX_RETRIES", "2"))
-        
+
         # Model settings - BIG and SMALL models
         self.big_model = os.environ.get("BIG_MODEL", "gpt-4o")
         self.middle_model = os.environ.get("MIDDLE_MODEL", self.big_model)
         self.small_model = os.environ.get("SMALL_MODEL", "gpt-4o-mini")
+
+        # Thinking / reasoning
+        # Upstream accepts: none, low, high, xhigh, max (DeepSeek-V4.1 rejects medium)
+        self.thinking_mode = os.environ.get("THINKING_MODE", "auto").strip().lower()
+        self.reasoning_effort = os.environ.get("REASONING_EFFORT", "auto").strip().lower()
+        self.thinking_display = os.environ.get("THINKING_DISPLAY", "summarized").strip().lower()
+        self.default_effort = os.environ.get("DEFAULT_EFFORT", "high").strip().lower()
+
+    def resolve_effort(self, client_effort: Optional[str]) -> str:
+        """Map Claude Code's effort values onto what the upstream accepts."""
+        ladder = ["low", "high", "xhigh", "max"]
+        if self.reasoning_effort != "auto":
+            return self.reasoning_effort
+        effort = (client_effort or "").strip().lower()
+        if effort in ladder:
+            return effort
+        if effort == "minimal":
+            return "low"
+        if effort == "none":
+            return "none"
+        # "medium" is not supported upstream; bump to the nearest accepted tier
+        if effort == "medium":
+            return "high"
+        return self.default_effort
         
     def validate_api_key(self):
         """Basic API key validation"""
