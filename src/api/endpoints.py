@@ -7,6 +7,7 @@ from typing import Optional
 from src.core.config import config
 from src.core.logging import logger
 from src.core.client import OpenAIClient
+from src.core.errors import anthropic_error_body, prompt_too_long_message
 from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
 from src.conversion.request_converter import convert_claude_to_openai
 from src.conversion.response_converter import (
@@ -111,13 +112,24 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                 openai_response, request
             )
             return claude_response
-    except HTTPException:
+    except HTTPException as e:
+        overflow_message = prompt_too_long_message(e.detail)
+        if overflow_message:
+            logger.warning(f"Upstream context overflow: {overflow_message}")
+            return JSONResponse(
+                status_code=400, content=anthropic_error_body(overflow_message)
+            )
         raise
     except Exception as e:
         import traceback
 
         logger.error(f"Unexpected error processing request: {e}")
         logger.error(traceback.format_exc())
+        overflow_message = prompt_too_long_message(e)
+        if overflow_message:
+            return JSONResponse(
+                status_code=400, content=anthropic_error_body(overflow_message)
+            )
         error_message = openai_client.classify_openai_error(str(e))
         raise HTTPException(status_code=500, detail=error_message)
 

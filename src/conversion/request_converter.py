@@ -9,13 +9,13 @@ logger = logging.getLogger(__name__)
 
 
 def _text_tokens(text: str) -> int:
-    """Approximate tokenizer cost: CJK runs about one token per character,
-    latin text about one per four."""
+    """Approximate tokenizer cost: common CJK runs about 0.5 tokens per
+    character, latin/code about one per four (measured against the upstream)."""
     cjk = 0
     for ch in text:
         if "一" <= ch <= "鿿" or "぀" <= ch <= "ヿ" or "가" <= ch <= "힯":
             cjk += 1
-    return cjk + (len(text) - cjk) // 4
+    return (cjk * 3) // 5 + (len(text) - cjk) // 4
 
 
 def estimate_tokens(messages: List[Dict[str, Any]]) -> int:

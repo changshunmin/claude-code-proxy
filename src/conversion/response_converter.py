@@ -2,6 +2,7 @@ import json
 import uuid
 from fastapi import HTTPException, Request
 from src.core.constants import Constants
+from src.core.errors import anthropic_error_body, prompt_too_long_message
 from src.models.claude import ClaudeMessagesRequest
 
 
@@ -198,10 +199,13 @@ async def convert_openai_streaming_to_claude_with_cancellation(
             usage = chunk.get("usage")
             if usage:
                 prompt_details = usage.get("prompt_tokens_details") or {}
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                cached_tokens = prompt_details.get("cached_tokens", 0)
+                # Anthropic 语义：input_tokens 不含缓存读取，而 prompt_tokens 已含
                 usage_data = {
-                    "input_tokens": usage.get("prompt_tokens", 0),
+                    "input_tokens": max(prompt_tokens - cached_tokens, 0),
                     "output_tokens": usage.get("completion_tokens", 0),
-                    "cache_read_input_tokens": prompt_details.get("cached_tokens", 0),
+                    "cache_read_input_tokens": cached_tokens,
                 }
 
             choices = chunk.get("choices") or []
@@ -321,8 +325,18 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                 {"type": "error", "error": {"type": "cancelled", "message": "Request was cancelled by client"}},
             )
             return
+        overflow_message = prompt_too_long_message(e.detail)
+        if overflow_message:
+            logger.warning(f"Upstream context overflow: {overflow_message}")
+            yield sse("error", anthropic_error_body(overflow_message))
+            return
         raise
     except Exception as e:
+        overflow_message = prompt_too_long_message(e)
+        if overflow_message:
+            logger.warning(f"Upstream context overflow: {overflow_message}")
+            yield sse("error", anthropic_error_body(overflow_message))
+            return
         logger.error(f"Streaming error: {e}")
         import traceback
 
