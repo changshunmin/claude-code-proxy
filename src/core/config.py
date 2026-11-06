@@ -37,28 +37,39 @@ class Config:
         self.small_model = os.environ.get("SMALL_MODEL", "gpt-4o-mini")
 
         # Thinking / reasoning
-        # Upstream accepts: none, low, high, xhigh, max (DeepSeek-V4.1 rejects medium)
+        # Official DeepSeek models accept: none, low, high, max (xhigh/medium are
+        # mapped onto this ladder by resolve_effort).
         self.thinking_mode = os.environ.get("THINKING_MODE", "auto").strip().lower()
         self.reasoning_effort = os.environ.get("REASONING_EFFORT", "auto").strip().lower()
         self.thinking_display = os.environ.get("THINKING_DISPLAY", "summarized").strip().lower()
         self.default_effort = os.environ.get("DEFAULT_EFFORT", "high").strip().lower()
 
     def resolve_effort(self, client_effort: Optional[str]) -> str:
-        """Map Claude Code's effort values onto what the upstream accepts."""
-        ladder = ["low", "high", "xhigh", "max"]
+        """Map Claude Code's effort values onto the official DeepSeek ladder.
+
+        Official supported levels are low/high/max; Claude Code may send xhigh
+        or medium, which are folded onto max/high respectively.
+        """
+        ladder = ["low", "high", "max"]
         if self.reasoning_effort != "auto":
-            return self.reasoning_effort
-        effort = (client_effort or "").strip().lower()
-        if effort in ladder:
-            return effort
-        if effort == "minimal":
-            return "low"
+            effort = self.reasoning_effort
+        else:
+            effort = (client_effort or "").strip().lower()
+            if effort == "minimal":
+                effort = "low"
+            # "medium" is not supported upstream; bump to the nearest accepted tier
+            elif effort == "medium":
+                effort = "high"
+
         if effort == "none":
             return "none"
-        # "medium" is not supported upstream; bump to the nearest accepted tier
-        if effort == "medium":
-            return "high"
-        return self.default_effort
+        if effort == "xhigh":
+            return "max"
+        if effort in ladder:
+            return effort
+
+        fallback = "max" if self.default_effort == "xhigh" else self.default_effort
+        return fallback if fallback in ladder else "high"
         
     def validate_api_key(self):
         """Basic API key validation"""
