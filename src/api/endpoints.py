@@ -172,6 +172,12 @@ async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(valid
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.api_route("/api/hello", methods=["GET", "HEAD"])
+async def hello_stub():
+    """Connectivity stub for Claude Code's /api/hello preconnect probe."""
+    return {"status": "ok"}
+
+
 @router.get("/health")
 async def health_check():
     """Health check endpoint"""

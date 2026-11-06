@@ -225,6 +225,23 @@ async def test_token_counting():
         print(json.dumps(response.json(), indent=2))
 
 
+async def test_hello_stub():
+    """Test the /api/hello connectivity stub accepts GET and HEAD."""
+    async with httpx.AsyncClient() as client:
+        get_response = await client.get("http://localhost:8082/api/hello")
+        head_response = await client.head("http://localhost:8082/api/hello")
+
+        print("\nHello stub GET status:", get_response.status_code)
+        print("Hello stub HEAD status:", head_response.status_code)
+
+        assert get_response.status_code == 200, (
+            f"GET /api/hello returned {get_response.status_code}"
+        )
+        assert head_response.status_code == 200, (
+            f"HEAD /api/hello returned {head_response.status_code}"
+        )
+
+
 async def test_health_and_connection():
     """Test health and connection endpoints."""
     async with httpx.AsyncClient() as client:
@@ -245,6 +262,7 @@ async def main():
     print("=" * 50)
     
     try:
+        await test_hello_stub()
         await test_health_and_connection()
         await test_token_counting()
         await test_basic_chat()
