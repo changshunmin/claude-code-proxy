@@ -116,11 +116,12 @@ def _request(**overrides):
 TOOL = {"name": "Bash", "description": "run a command", "input_schema": {"type": "object"}}
 
 
-def test_tool_choice_any_maps_to_required():
+def test_tool_choice_any_maps_to_auto_like_official_endpoint():
+    # Official DeepSeek compatibility: "any" is treated as "auto".
     out = convert_claude_to_openai(
         _request(tool_choice={"type": "any"}, tools=[TOOL]), model_manager
     )
-    assert out["tool_choice"] == "required"
+    assert out["tool_choice"] == "auto"
 
 
 def test_tool_choice_none_maps_to_none():
@@ -169,6 +170,66 @@ def test_count_tokens_includes_tool_schemas():
     assert with_tools > plain
 
 
+def test_max_tokens_optional_like_official_endpoint():
+    out = convert_claude_to_openai(
+        ClaudeMessagesRequest(
+            model="deepseek-flash", messages=[{"role": "user", "content": "hi"}]
+        ),
+        model_manager,
+    )
+    assert 0 < out["max_tokens"] <= model_manager.config.model_max_output
+
+
+def test_server_tools_are_skipped_not_failing():
+    out = convert_claude_to_openai(
+        _request(
+            tools=[
+                TOOL,
+                {"type": "web_search_20250305", "name": "web_search"},
+            ]
+        ),
+        model_manager,
+    )
+    assert [t["function"]["name"] for t in out["tools"]] == ["Bash"]
+
+
+def test_url_image_is_passed_through_as_image_url():
+    from src.conversion.request_converter import convert_claude_user_message
+
+    msg = ClaudeMessage(
+        role="user",
+        content=[
+            {
+                "type": "image",
+                "source": {"type": "url", "url": "https://example.com/a.png"},
+            },
+            {"type": "text", "text": "what is this"},
+        ],
+    )
+    converted = convert_claude_user_message(msg)
+    assert {
+        "type": "image_url",
+        "image_url": {"url": "https://example.com/a.png"},
+    } in converted["content"]
+
+
+def test_text_after_tool_result_is_preserved():
+    msg = ClaudeMessage(
+        role="user",
+        content=[
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_5",
+                "content": "ok",
+            },
+            {"type": "text", "text": "and then?"},
+        ],
+    )
+    messages = convert_claude_tool_results(msg)
+    assert messages[0]["role"] == "tool"
+    assert messages[1] == {"role": "user", "content": "and then?"}
+
+
 def test_count_tokens_ignores_base64_image_payload():
     msg = ClaudeMessage(
         role="user",
@@ -186,3 +247,72 @@ def test_count_tokens_ignores_base64_image_payload():
         ],
     )
     assert estimate_claude_token_count(None, [msg], None) < 100
+
+
+# --- mid-conversation system messages (CC 2.1.x beta) ------------------------
+
+def test_system_role_message_is_accepted_and_folded_into_system_prompt():
+    """Claude Code 2.1.x sends SessionStart hook context as a message with
+    role="system" when it probes the beta mid-conversation-system shape.  The
+    proxy must accept it instead of returning 422 and folding it into the
+    leading system prompt keeps the instructions in front of the conversation."""
+    req = ClaudeMessagesRequest(
+        model="claude-opus-5-5",
+        max_tokens=128,
+        system="TOP-LEVEL",
+        messages=[
+            ClaudeMessage(role="user", content="hi"),
+            ClaudeMessage(
+                role="system",
+                content=[{"type": "text", "text": "HOOK CONTEXT"}],
+            ),
+        ],
+    )
+
+    converted = convert_claude_to_openai(req, model_manager)
+    assert converted["messages"][0]["role"] == "system"
+    assert "TOP-LEVEL" in converted["messages"][0]["content"]
+    assert "HOOK CONTEXT" in converted["messages"][0]["content"]
+    assert [m["role"] for m in converted["messages"][1:]] == ["user"]
+    assert converted["messages"][1]["content"] == "hi"
+
+
+def test_system_role_message_without_top_level_system_creates_one():
+    req = ClaudeMessagesRequest(
+        model="claude-opus-5-5",
+        max_tokens=128,
+        messages=[
+            ClaudeMessage(role="system", content="HOOK CONTEXT"),
+            ClaudeMessage(role="user", content="hi"),
+        ],
+    )
+
+    converted = convert_claude_to_openai(req, model_manager)
+    assert converted["messages"][0] == {
+        "role": "system",
+        "content": "HOOK CONTEXT",
+    }
+    assert converted["messages"][1]["content"] == "hi"
+
+
+def test_system_role_message_ignores_non_text_blocks():
+    req = ClaudeMessagesRequest(
+        model="claude-opus-5-5",
+        max_tokens=128,
+        messages=[
+            ClaudeMessage(
+                role="system",
+                content=[
+                    {"type": "text", "text": "KEEP"},
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": B64},
+                    },
+                ],
+            ),
+            ClaudeMessage(role="user", content="hi"),
+        ],
+    )
+
+    converted = convert_claude_to_openai(req, model_manager)
+    assert converted["messages"][0]["content"] == "KEEP"

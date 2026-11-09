@@ -45,7 +45,9 @@ class ClaudeSystemContent(BaseModel):
 
 
 class ClaudeMessage(BaseModel):
-    role: Literal["user", "assistant"]
+    # Claude Code 2.1.x probes the beta mid-conversation-system shape and sends
+    # SessionStart hook context as role="system" inside `messages`.
+    role: Literal["user", "assistant", "system"]
     content: Union[
         str,
         List[
@@ -62,9 +64,11 @@ class ClaudeMessage(BaseModel):
 
 
 class ClaudeTool(BaseModel):
+    # Client tools omit `type`; server tools (web_search_20250305, ...) set it.
+    type: Optional[str] = None
     name: str
     description: Optional[str] = None
-    input_schema: Dict[str, Any]
+    input_schema: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ClaudeThinkingConfig(BaseModel):
@@ -80,7 +84,8 @@ class ClaudeOutputConfig(BaseModel):
 
 class ClaudeMessagesRequest(BaseModel):
     model: str
-    max_tokens: int
+    # Optional for raw HTTP requests, like the official DeepSeek endpoint.
+    max_tokens: Optional[int] = None
     messages: List[ClaudeMessage]
     system: Optional[Union[str, List[ClaudeSystemContent]]] = None
     stop_sequences: Optional[List[str]] = None
@@ -94,6 +99,10 @@ class ClaudeMessagesRequest(BaseModel):
     thinking: Optional[ClaudeThinkingConfig] = None
     output_config: Optional[ClaudeOutputConfig] = None
     context_management: Optional[Dict[str, Any]] = None
+    # Auto mode server-side classifier request (paired with the
+    # dangerous-tool-use beta header). Kept so the relay can answer with a
+    # truthful "unsupported" result; it is never forwarded upstream.
+    safeguards: Optional[List[Dict[str, Any]]] = None
 
 
 class ClaudeTokenCountRequest(BaseModel):

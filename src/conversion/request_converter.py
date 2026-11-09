@@ -121,7 +121,13 @@ def resolve_max_tokens(
     claude_request: ClaudeMessagesRequest, openai_messages: List[Dict[str, Any]]
 ) -> int:
     """Clamp the requested output size to both the output cap and the model window."""
-    requested = max(claude_request.max_tokens, config.min_tokens_limit)
+    requested = claude_request.max_tokens
+    if requested is None:
+        # The official endpoint makes max_tokens optional and picks a
+        # model-dependent default; ours starts at the hard output cap and is
+        # then clamped to the remaining window below.
+        requested = config.model_max_output
+    requested = max(requested, config.min_tokens_limit)
     limit = min(requested, config.max_tokens_limit, config.model_max_output)
 
     remaining = config.model_max_context - estimate_tokens(openai_messages)
@@ -161,6 +167,22 @@ def apply_thinking_config(
     extra_body["reasoning_effort"] = effort
 
 
+def extract_text_content(content) -> str:
+    """Flatten a Claude message `content` (string or block list) to plain text,
+    skipping non-text blocks such as images."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for block in content:
+        if hasattr(block, "type") and block.type == Constants.CONTENT_TEXT:
+            parts.append(block.text)
+        elif isinstance(block, dict) and block.get("type") == Constants.CONTENT_TEXT:
+            parts.append(block.get("text", ""))
+    return "\n\n".join(parts)
+
+
 def convert_claude_to_openai(
     claude_request: ClaudeMessagesRequest, model_manager
 ) -> Dict[str, Any]:
@@ -172,34 +194,33 @@ def convert_claude_to_openai(
     # Convert messages
     openai_messages = []
 
-    # Add system message if present
+    # Collect system prompt text.  Besides the top-level `system` field, Claude
+    # Code 2.1.x sends mid-conversation system messages (beta) with
+    # role="system" inside `messages`; folding them into the leading system
+    # message mirrors the client's own fallback shape and keeps the upstream
+    # conversation starting with a single system turn.
+    system_parts = []
     if claude_request.system:
-        system_text = ""
-        if isinstance(claude_request.system, str):
-            system_text = claude_request.system
-        elif isinstance(claude_request.system, list):
-            text_parts = []
-            for block in claude_request.system:
-                if hasattr(block, "type") and block.type == Constants.CONTENT_TEXT:
-                    text_parts.append(block.text)
-                elif (
-                    isinstance(block, dict)
-                    and block.get("type") == Constants.CONTENT_TEXT
-                ):
-                    text_parts.append(block.get("text", ""))
-            system_text = "\n\n".join(text_parts)
+        system_parts.append(extract_text_content(claude_request.system))
+    for msg in claude_request.messages:
+        if msg.role == Constants.ROLE_SYSTEM:
+            system_parts.append(extract_text_content(msg.content))
 
-        if system_text.strip():
-            openai_messages.append(
-                {"role": Constants.ROLE_SYSTEM, "content": system_text.strip()}
-            )
+    system_text = "\n\n".join(part.strip() for part in system_parts if part.strip())
+    if system_text:
+        openai_messages.append(
+            {"role": Constants.ROLE_SYSTEM, "content": system_text}
+        )
 
     # Process Claude messages
     i = 0
     while i < len(claude_request.messages):
         msg = claude_request.messages[i]
 
-        if msg.role == Constants.ROLE_USER:
+        if msg.role == Constants.ROLE_SYSTEM:
+            # Already merged into the leading system message above.
+            pass
+        elif msg.role == Constants.ROLE_USER:
             openai_message = convert_claude_user_message(msg)
             openai_messages.append(openai_message)
         elif msg.role == Constants.ROLE_ASSISTANT:
@@ -245,6 +266,13 @@ def convert_claude_to_openai(
     if claude_request.tools:
         openai_tools = []
         for tool in claude_request.tools:
+            # Server tools (web_search_20250305, ...) are executed by the
+            # official DeepSeek API, not by the client, so there is nothing to
+            # forward to an OpenAI-compatible upstream. Ignore them instead of
+            # failing the whole request.
+            if tool.type and tool.type != "custom":
+                logger.debug(f"Skipping server-side tool: {tool.name} ({tool.type})")
+                continue
             if tool.name and tool.name.strip():
                 openai_tools.append(
                     {
@@ -265,8 +293,9 @@ def convert_claude_to_openai(
         if choice_type == "auto":
             openai_request["tool_choice"] = "auto"
         elif choice_type == "any":
-            # Claude's "any" requires some tool call; OpenAI spells it "required"
-            openai_request["tool_choice"] = "required"
+            # The official DeepSeek Anthropic endpoint treats "any" as "auto"
+            # (it does not force a tool call); mirror that behaviour.
+            openai_request["tool_choice"] = "auto"
         elif choice_type == "none":
             openai_request["tool_choice"] = "none"
         elif choice_type == "tool" and "name" in claude_request.tool_choice:
@@ -298,7 +327,15 @@ def convert_claude_user_message(msg: ClaudeMessage) -> Dict[str, Any]:
             openai_content.append({"type": "text", "text": block.text})
         elif block.type == Constants.CONTENT_IMAGE:
             # Convert Claude image format to OpenAI format
-            if (
+            if isinstance(block.source, dict) and block.source.get("type") == "url":
+                if block.source.get("url"):
+                    openai_content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": block.source["url"]},
+                        }
+                    )
+            elif (
                 isinstance(block.source, dict)
                 and block.source.get("type") == "base64"
                 and "media_type" in block.source
@@ -378,9 +415,14 @@ def convert_claude_tool_results(msg: ClaudeMessage) -> List[Dict[str, Any]]:
     (e.g. the Read tool) are re-attached as a follow-up user message with
     image_url blocks. Serializing them into the tool text instead would make
     the upstream tokenize the raw base64 (~1.45 chars/token).
+
+    The official endpoint allows text blocks in the same user message after
+    the tool_result blocks; keep them as a follow-up user message instead of
+    dropping them.
     """
     tool_messages = []
     images = []
+    trailing_text = []
 
     if isinstance(msg.content, list):
         for block in msg.content:
@@ -396,11 +438,40 @@ def convert_claude_tool_results(msg: ClaudeMessage) -> List[Dict[str, Any]]:
                     }
                 )
                 images.extend(image_blocks)
+            elif block.type == Constants.CONTENT_TEXT and block.text:
+                trailing_text.append(block.text)
+            elif block.type == Constants.CONTENT_IMAGE:
+                image_blocks = image_block_to_openai(block)
+                if image_blocks:
+                    images.append(image_blocks)
 
-    if images:
-        tool_messages.append({"role": Constants.ROLE_USER, "content": images})
+    if trailing_text or images:
+        if trailing_text and not images:
+            user_content: Any = "\n".join(trailing_text)
+        else:
+            user_content = []
+            if trailing_text:
+                user_content.append({"type": "text", "text": "\n".join(trailing_text)})
+            user_content.extend(images)
+        tool_messages.append({"role": Constants.ROLE_USER, "content": user_content})
 
     return tool_messages
+
+
+def image_block_to_openai(block) -> Optional[Dict[str, Any]]:
+    """Convert a Claude image block (base64 or url) to an OpenAI image block."""
+    source = getattr(block, "source", None)
+    if not isinstance(source, dict):
+        return None
+    if source.get("type") == "url" and source.get("url"):
+        return {"type": "image_url", "image_url": {"url": source["url"]}}
+    if source.get("type") == "base64" and source.get("data"):
+        media_type = source.get("media_type") or "image/png"
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{media_type};base64,{source['data']}"},
+        }
+    return None
 
 
 def parse_tool_result_content(content):

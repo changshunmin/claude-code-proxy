@@ -17,7 +17,7 @@ from src.conversion.response_converter import (
     convert_openai_to_claude_response,
     convert_openai_streaming_to_claude_with_cancellation,
 )
-from src.core.model_manager import model_manager
+from src.core.model_manager import model_manager, UnknownModelError
 
 router = APIRouter()
 
@@ -65,7 +65,13 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
         request_id = str(uuid.uuid4())
 
         # Convert Claude request to OpenAI format
-        openai_request = convert_claude_to_openai(request, model_manager)
+        try:
+            openai_request = convert_claude_to_openai(request, model_manager)
+        except UnknownModelError as e:
+            logger.warning(f"Rejected unsupported model: {request.model}")
+            return JSONResponse(
+                status_code=400, content=anthropic_error_body(str(e))
+            )
 
         # Check if client disconnected before processing
         if await http_request.is_disconnected():
@@ -150,10 +156,99 @@ async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(valid
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/models")
+async def list_models():
+    """DeepSeek-compatible model catalog.
+
+    Mirrors ``GET https://api.deepseek.com/models`` but reports the real
+    window of the checkpoint this relay serves (262144 context / 128000
+    output by default) instead of the hosted 1M-context values.
+    """
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "deepseek-flash",
+                "object": "model",
+                "owned_by": "deepseek",
+                "name": config.big_model,
+                "context_window": config.model_max_context,
+                "max_output_tokens": config.model_max_output,
+                "input_modalities": ["text", "image"],
+                "output_modalities": ["text"],
+                "effort": {
+                    "supported_levels": ["low", "high", "max"],
+                    "default_level": "high",
+                },
+                "api_capabilities": {
+                    "anthropic_messages": {
+                        "system_prompt_update": "in-history",
+                        "tool_update": "addition-only",
+                    }
+                },
+            }
+        ],
+    }
+
+
 @router.api_route("/api/hello", methods=["GET", "HEAD"])
 async def hello_stub():
     """Connectivity stub for Claude Code's /api/hello preconnect probe."""
     return {"status": "ok"}
+
+
+@router.post("/api/event_logging/v2/batch")
+async def event_logging_batch(request: Request):
+    """Accept Claude Code's first-party telemetry batches.
+
+    CC posts ``{"events": [...]}`` here and treats a 2xx response carrying
+    ``{"accepted_count": N}`` as success; non-2xx responses trigger retries
+    with backoff. Answering like the real API keeps the telemetry path
+    healthy when api.anthropic.com resolves to this proxy.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = None
+    events = payload.get("events") if isinstance(payload, dict) else None
+    count = len(events) if isinstance(events, list) else 0
+    logger.debug(f"Accepted event logging batch: {count} events")
+    return {"accepted_count": count}
+
+
+@router.api_route("/api/health", methods=["GET", "HEAD"])
+async def api_health_stub():
+    """Health probe at the path Claude Code actually calls."""
+    return {"status": "ok"}
+
+
+@router.post("/api/eval/{client_key}")
+@router.post("/api/eval-authed/{client_key}")
+async def growthbook_eval_stub(client_key: str):
+    """GrowthBook remote-eval endpoint used for feature flags.
+
+    Returning an empty feature set makes Claude Code fall back to its
+    built-in defaults, as it would for a workspace without overrides.
+    """
+    return {
+        "features": {},
+        "experiments": [],
+        "savedGroups": {},
+        "date": datetime.now().isoformat(),
+    }
+
+
+@router.get("/api/directory/plugins")
+async def plugin_directory_stub():
+    """Plugin marketplace catalog: an empty first page."""
+    return {"data": []}
+
+
+@router.get("/mcp-registry/v0/servers")
+@router.get("/api/directory/servers")
+async def mcp_registry_stub():
+    """MCP server directory: an empty list with no continuation cursor."""
+    return {"servers": [], "metadata": {}}
 
 
 @router.get("/health")

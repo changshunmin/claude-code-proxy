@@ -3,6 +3,7 @@ import uuid
 from fastapi import HTTPException, Request
 from src.core.constants import Constants
 from src.core.errors import anthropic_error_body, prompt_too_long_message
+from src.conversion.request_converter import estimate_claude_token_count
 from src.models.claude import ClaudeMessagesRequest
 
 
@@ -18,14 +19,23 @@ def convert_openai_to_claude_response(
 
     choice = choices[0]
     message = choice.get("message", {})
+    response_id = openai_response.get("id", f"msg_{uuid.uuid4()}")
 
     # Build Claude content blocks
     content_blocks = []
 
-    # Add reasoning first: Claude expects thinking ahead of text/tool_use
+    # Add reasoning first: Claude expects thinking ahead of text/tool_use.
+    # Thinking blocks need a signature; the official DeepSeek endpoint uses
+    # the message id, and our converter ignores it when replaying history.
     reasoning = message.get("reasoning") or message.get("reasoning_content")
     if reasoning:
-        content_blocks.append({"type": Constants.CONTENT_THINKING, "thinking": reasoning})
+        content_blocks.append(
+            {
+                "type": Constants.CONTENT_THINKING,
+                "thinking": reasoning,
+                "signature": response_id,
+            }
+        )
 
     # Add text content
     text_content = message.get("content")
@@ -64,9 +74,17 @@ def convert_openai_to_claude_response(
         "function_call": Constants.STOP_TOOL_USE,
     }.get(finish_reason, Constants.STOP_END_TURN)
 
+    # Usage follows Anthropic semantics: input_tokens excludes cache reads,
+    # cache_read_input_tokens is the cached portion. service_tier mirrors the
+    # official endpoint's response.
+    usage = openai_response.get("usage", {}) or {}
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    cached_tokens = prompt_details.get("cached_tokens", 0) or 0
+    prompt_tokens = usage.get("prompt_tokens", 0) or 0
+
     # Build Claude response
     claude_response = {
-        "id": openai_response.get("id", f"msg_{uuid.uuid4()}"),
+        "id": response_id,
         "type": "message",
         "role": Constants.ROLE_ASSISTANT,
         "model": original_request.model,
@@ -74,12 +92,18 @@ def convert_openai_to_claude_response(
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
-            "input_tokens": openai_response.get("usage", {}).get("prompt_tokens", 0),
-            "output_tokens": openai_response.get("usage", {}).get(
-                "completion_tokens", 0
-            ),
+            "input_tokens": max(prompt_tokens - cached_tokens, 0),
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": cached_tokens,
+            "output_tokens": usage.get("completion_tokens", 0),
+            "service_tier": "standard",
         },
     }
+
+    if original_request.safeguards:
+        claude_response["safeguard_results"] = _unsupported_safeguard_results(
+            original_request
+        )
 
     return claude_response
 
@@ -102,6 +126,43 @@ def _map_stop_reason(finish_reason):
     return Constants.STOP_END_TURN
 
 
+_HTTP_STATUS_TO_ANTHROPIC_ERROR = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    429: "rate_limit_error",
+    500: "api_error",
+    529: "overloaded_error",
+}
+
+
+def _anthropic_error_type(status_code: int) -> str:
+    """Map an upstream HTTP status to an Anthropic stream error type."""
+    return _HTTP_STATUS_TO_ANTHROPIC_ERROR.get(status_code, "api_error")
+
+
+def _unsupported_safeguard_results(original_request: ClaudeMessagesRequest):
+    """Answer auto mode's server-side classifier request with "unsupported".
+
+    The relay forwards to an OpenAI-protocol upstream, which cannot run
+    Anthropic's server-side check. Saying so explicitly makes Claude Code
+    fall back to its own classifier for the session instead of assuming a
+    proxy dropped the result. One verdict per type: more than one
+    ``dangerous_tool_use`` entry is treated as unrecognized.
+    """
+    types = []
+    for item in original_request.safeguards or []:
+        result_type = item.get("type") if isinstance(item, dict) else None
+        if result_type and result_type not in types:
+            types.append(result_type)
+    return [
+        {"type": result_type, "status": {"type": "unsupported"}}
+        for result_type in types
+    ]
+
+
 async def convert_openai_streaming_to_claude_with_cancellation(
     openai_stream,
     original_request: ClaudeMessagesRequest,
@@ -116,6 +177,12 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     Claude thinking block ahead of the text and tool_use blocks.
     """
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
+    # The official endpoint reports the prompt size in message_start; mirror
+    # that with our tokenizer estimate so clients see a non-zero context
+    # immediately instead of waiting for message_delta.
+    estimated_input_tokens = estimate_claude_token_count(
+        original_request.system, original_request.messages, original_request.tools
+    )
 
     def sse(event, data):
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -132,7 +199,13 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "usage": {
+                    "input_tokens": estimated_input_tokens,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 0,
+                    "service_tier": "standard",
+                },
             },
         },
     )
@@ -146,7 +219,13 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     text_open = False
     current_tool_calls = {}
     final_stop_reason = Constants.STOP_END_TURN
-    usage_data = {"input_tokens": 0, "output_tokens": 0}
+    usage_data = {
+        "input_tokens": estimated_input_tokens,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 0,
+        "service_tier": "standard",
+    }
 
     def start_thinking():
         nonlocal next_index, thinking_index
@@ -162,15 +241,28 @@ async def convert_openai_streaming_to_claude_with_cancellation(
             next_index += 1
         return text_index
 
-    def close_thinking_if_open():
+    def close_thinking_events():
         nonlocal thinking_open
         if thinking_index is not None and thinking_open:
             thinking_open = False
-            return sse(
-                Constants.EVENT_CONTENT_BLOCK_STOP,
-                {"type": Constants.EVENT_CONTENT_BLOCK_STOP, "index": thinking_index},
-            )
-        return None
+            return [
+                sse(
+                    Constants.EVENT_CONTENT_BLOCK_DELTA,
+                    {
+                        "type": Constants.EVENT_CONTENT_BLOCK_DELTA,
+                        "index": thinking_index,
+                        "delta": {
+                            "type": Constants.DELTA_SIGNATURE,
+                            "signature": message_id,
+                        },
+                    },
+                ),
+                sse(
+                    Constants.EVENT_CONTENT_BLOCK_STOP,
+                    {"type": Constants.EVENT_CONTENT_BLOCK_STOP, "index": thinking_index},
+                ),
+            ]
+        return []
 
     try:
         async for line in openai_stream:
@@ -204,8 +296,10 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                 # Anthropic 语义：input_tokens 不含缓存读取，而 prompt_tokens 已含
                 usage_data = {
                     "input_tokens": max(prompt_tokens - cached_tokens, 0),
-                    "output_tokens": usage.get("completion_tokens", 0),
+                    "cache_creation_input_tokens": 0,
                     "cache_read_input_tokens": cached_tokens,
+                    "output_tokens": usage.get("completion_tokens", 0),
+                    "service_tier": "standard",
                 }
 
             choices = chunk.get("choices") or []
@@ -240,9 +334,8 @@ async def convert_openai_streaming_to_claude_with_cancellation(
 
             content_delta = delta.get("content")
             if content_delta:
-                closed = close_thinking_if_open()
-                if closed:
-                    yield closed
+                for event in close_thinking_events():
+                    yield event
                 index = start_text()
                 if not text_open:
                     text_open = True
@@ -277,9 +370,8 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                     tool_call["name"] = function_data["name"]
 
                 if tool_call["index"] is None and tool_call["id"] and tool_call["name"]:
-                    closed = close_thinking_if_open()
-                    if closed:
-                        yield closed
+                    for event in close_thinking_events():
+                        yield event
                     if text_open:
                         text_open = False
                         yield sse(
@@ -330,7 +422,16 @@ async def convert_openai_streaming_to_claude_with_cancellation(
             logger.warning(f"Upstream context overflow: {overflow_message}")
             yield sse("error", anthropic_error_body(overflow_message))
             return
-        raise
+        # The response has already started, so an HTTP status can no longer be
+        # sent. Report the failure inside the stream instead of raising, which
+        # would make Starlette log "Caught handled exception, but response
+        # already started." and leave the client with a silent truncation.
+        logger.error(f"Upstream streaming error {e.status_code}: {e.detail}")
+        yield sse(
+            "error",
+            anthropic_error_body(str(e.detail), _anthropic_error_type(e.status_code)),
+        )
+        return
     except Exception as e:
         overflow_message = prompt_too_long_message(e)
         if overflow_message:
@@ -348,11 +449,8 @@ async def convert_openai_streaming_to_claude_with_cancellation(
         return
 
     # Close whatever is still open; blocks already closed mid-stream are skipped
-    if thinking_index is not None and thinking_open:
-        yield sse(
-            Constants.EVENT_CONTENT_BLOCK_STOP,
-            {"type": Constants.EVENT_CONTENT_BLOCK_STOP, "index": thinking_index},
-        )
+    for event in close_thinking_events():
+        yield event
     if text_index is not None and text_open:
         yield sse(
             Constants.EVENT_CONTENT_BLOCK_STOP,
@@ -368,11 +466,16 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     if final_stop_reason == Constants.STOP_END_TURN and current_tool_calls:
         final_stop_reason = Constants.STOP_TOOL_USE
 
+    message_delta = {"stop_reason": final_stop_reason, "stop_sequence": None}
+    if original_request.safeguards:
+        message_delta["safeguard_results"] = _unsupported_safeguard_results(
+            original_request
+        )
     yield sse(
         Constants.EVENT_MESSAGE_DELTA,
         {
             "type": Constants.EVENT_MESSAGE_DELTA,
-            "delta": {"stop_reason": final_stop_reason, "stop_sequence": None},
+            "delta": message_delta,
             "usage": usage_data,
         },
     )

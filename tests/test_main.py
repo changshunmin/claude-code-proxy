@@ -7,12 +7,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from src.core.config import config
+
+
+BASE_URL = f"http://127.0.0.1:{config.port}"
+AUTH_HEADERS = (
+    {"x-api-key": config.anthropic_api_key} if config.anthropic_api_key else {}
+)
+
 
 async def test_basic_chat():
     """Test basic chat completion."""
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(headers=AUTH_HEADERS) as client:
         response = await client.post(
-            "http://localhost:8082/v1/messages",
+            f"{BASE_URL}/v1/messages",
             json={
                 "model": "claude-3-5-sonnet-20241022",
                 "max_tokens": 100,
@@ -28,10 +36,10 @@ async def test_basic_chat():
 
 async def test_streaming_chat():
     """Test streaming chat completion."""
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(headers=AUTH_HEADERS) as client:
         async with client.stream(
             "POST",
-            "http://localhost:8082/v1/messages",
+            f"{BASE_URL}/v1/messages",
             json={
                 "model": "claude-3-5-haiku-20241022",
                 "max_tokens": 150,
@@ -49,9 +57,9 @@ async def test_streaming_chat():
 
 async def test_function_calling():
     """Test function calling capability."""
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(headers=AUTH_HEADERS) as client:
         response = await client.post(
-            "http://localhost:8082/v1/messages",
+            f"{BASE_URL}/v1/messages",
             json={
                 "model": "claude-3-5-sonnet-20241022",
                 "max_tokens": 200,
@@ -89,9 +97,9 @@ async def test_function_calling():
 
 async def test_with_system_message():
     """Test with system message."""
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(headers=AUTH_HEADERS) as client:
         response = await client.post(
-            "http://localhost:8082/v1/messages",
+            f"{BASE_URL}/v1/messages",
             json={
                 "model": "claude-3-5-sonnet-20241022",
                 "max_tokens": 100,
@@ -108,12 +116,12 @@ async def test_with_system_message():
 
 async def test_multimodal():
     """Test multimodal input (text + image)."""
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(headers=AUTH_HEADERS) as client:
         # Sample base64 image (1x1 pixel transparent PNG)
         sample_image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChAI9jU8PJAAAAASUVORK5CYII="
         
         response = await client.post(
-            "http://localhost:8082/v1/messages",
+            f"{BASE_URL}/v1/messages",
             json={
                 "model": "claude-3-5-sonnet-20241022",
                 "max_tokens": 100,
@@ -142,10 +150,10 @@ async def test_multimodal():
 
 async def test_conversation_with_tool_use():
     """Test a complete conversation with tool use and results."""
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(headers=AUTH_HEADERS) as client:
         # First message with tool call
         response1 = await client.post(
-            "http://localhost:8082/v1/messages",
+            f"{BASE_URL}/v1/messages",
             json={
                 "model": "claude-3-5-sonnet-20241022",
                 "max_tokens": 200,
@@ -183,7 +191,7 @@ async def test_conversation_with_tool_use():
                 
                 # Second message with tool result
                 response2 = await client.post(
-                    "http://localhost:8082/v1/messages",
+                    f"{BASE_URL}/v1/messages",
                     json={
                         "model": "claude-3-5-sonnet-20241022",
                         "max_tokens": 100,
@@ -210,9 +218,9 @@ async def test_conversation_with_tool_use():
 
 async def test_token_counting():
     """Test token counting endpoint."""
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(headers=AUTH_HEADERS) as client:
         response = await client.post(
-            "http://localhost:8082/v1/messages/count_tokens",
+            f"{BASE_URL}/v1/messages/count_tokens",
             json={
                 "model": "claude-3-5-sonnet-20241022",
                 "messages": [
@@ -227,9 +235,9 @@ async def test_token_counting():
 
 async def test_hello_stub():
     """Test the /api/hello connectivity stub accepts GET and HEAD."""
-    async with httpx.AsyncClient() as client:
-        get_response = await client.get("http://localhost:8082/api/hello")
-        head_response = await client.head("http://localhost:8082/api/hello")
+    async with httpx.AsyncClient(headers=AUTH_HEADERS) as client:
+        get_response = await client.get(f"{BASE_URL}/api/hello")
+        head_response = await client.head(f"{BASE_URL}/api/hello")
 
         print("\nHello stub GET status:", get_response.status_code)
         print("Hello stub HEAD status:", head_response.status_code)
@@ -244,14 +252,14 @@ async def test_hello_stub():
 
 async def test_health_and_connection():
     """Test health and connection endpoints."""
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(headers=AUTH_HEADERS) as client:
         # Health check
-        health_response = await client.get("http://localhost:8082/health")
+        health_response = await client.get(f"{BASE_URL}/health")
         print("\nHealth check:")
         print(json.dumps(health_response.json(), indent=2))
         
         # Connection test
-        connection_response = await client.get("http://localhost:8082/test-connection")
+        connection_response = await client.get(f"{BASE_URL}/test-connection")
         print("\nConnection test:")
         print(json.dumps(connection_response.json(), indent=2))
 

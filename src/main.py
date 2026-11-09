@@ -1,12 +1,56 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from src.api.endpoints import router as api_router
 import uvicorn
 import sys
+import json
 from src.core.config import config
+from src.core.logging import logger
 
 app = FastAPI(title="Claude-to-OpenAI API Proxy", version="1.0.0")
 
+# Two mount points:
+#   /           legacy surface (ANTHROPIC_BASE_URL=http://host:port)
+#   /anthropic  same surface under the official DeepSeek Anthropic base path
+#               (ANTHROPIC_BASE_URL=http://api.deepseek.com/anthropic)
 app.include_router(api_router)
+app.include_router(api_router, prefix="/anthropic")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+):
+    """Log request bodies that fail Pydantic validation and reply in
+    Anthropic's error format (400 invalid_request_error) instead of
+    FastAPI's default 422 ``detail`` payload."""
+    try:
+        raw_body = (await request.body()).decode("utf-8", "replace")
+    except Exception:
+        raw_body = "<unreadable>"
+    errors = exc.errors()
+    logger.error(
+        "Request validation failed: %s %s errors=%s body=%s",
+        request.method,
+        request.url,
+        json.dumps(errors, ensure_ascii=False, default=str),
+        raw_body[:8000],
+    )
+    messages = []
+    for err in errors:
+        loc = ".".join(str(part) for part in err.get("loc", []))
+        messages.append(f"{loc}: {err.get('msg', 'invalid value')}")
+    return JSONResponse(
+        status_code=400,
+        content={
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Invalid request: " + "; ".join(messages),
+            },
+        },
+    )
 
 
 def main():
