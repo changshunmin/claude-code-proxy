@@ -7,7 +7,11 @@ from typing import Optional
 from src.core.config import config
 from src.core.logging import claude_request_params, logger
 from src.core.client import OpenAIClient
-from src.core.errors import anthropic_error_body, prompt_too_long_message
+from src.core.errors import (
+    anthropic_error_body,
+    anthropic_error_type,
+    prompt_too_long_message,
+)
 from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
 from src.conversion.request_converter import (
     convert_claude_to_openai,
@@ -131,7 +135,14 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
             return JSONResponse(
                 status_code=400, content=anthropic_error_body(overflow_message)
             )
-        raise
+        # Anthropic SDK clients can only parse the Anthropic error envelope;
+        # FastAPI's default {"detail": ...} shape breaks them.
+        return JSONResponse(
+            status_code=e.status_code,
+            content=anthropic_error_body(
+                str(e.detail), anthropic_error_type(e.status_code)
+            ),
+        )
     except Exception as e:
         import traceback
 
@@ -146,7 +157,10 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                 status_code=400, content=anthropic_error_body(overflow_message)
             )
         error_message = openai_client.classify_openai_error(str(e))
-        raise HTTPException(status_code=500, detail=error_message)
+        return JSONResponse(
+            status_code=500,
+            content=anthropic_error_body(error_message, "api_error"),
+        )
 
 
 @router.post("/v1/messages/count_tokens")

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import List, Dict, Any, Optional, Union, Literal
 
 
@@ -38,6 +38,49 @@ class ClaudeContentBlockToolResult(BaseModel):
     is_error: Optional[bool] = None
 
 
+class ClaudeContentBlockToolAddition(BaseModel):
+    # Claude Code 2.1.x announces deferred tools mid-conversation with this
+    # metadata block; it carries no model-facing content of its own.
+    type: Literal["tool_addition"]
+    tool: Optional[Dict[str, Any]] = None
+    cache_control: Optional[Dict[str, Any]] = None
+
+
+_KNOWN_CONTENT_BLOCK_TYPES = frozenset(
+    {
+        "text",
+        "image",
+        "thinking",
+        "redacted_thinking",
+        "tool_use",
+        "tool_result",
+        "tool_addition",
+    }
+)
+
+
+class ClaudeContentBlockUnknown(BaseModel):
+    """Catch-all for metadata blocks this relay does not model yet.
+
+    Claude Code keeps introducing client-side block types (e.g. tool_removal).
+    Accepting them here keeps a single unknown block from 400-ing the whole
+    request; the converter drops them because they carry no model-facing
+    content. Known types are rejected so a malformed text/tool_use block
+    still fails validation instead of silently passing as "unknown".
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str
+
+    @field_validator("type")
+    @classmethod
+    def _reject_known_types(cls, value: str) -> str:
+        if value in _KNOWN_CONTENT_BLOCK_TYPES:
+            raise ValueError(f"malformed known content block: {value}")
+        return value
+
+
 class ClaudeSystemContent(BaseModel):
     type: Literal["text"]
     text: str
@@ -58,6 +101,8 @@ class ClaudeMessage(BaseModel):
                 ClaudeContentBlockRedactedThinking,
                 ClaudeContentBlockToolUse,
                 ClaudeContentBlockToolResult,
+                ClaudeContentBlockToolAddition,
+                ClaudeContentBlockUnknown,
             ]
         ],
     ]

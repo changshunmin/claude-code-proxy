@@ -1,11 +1,33 @@
 import asyncio
 import json
+import re
 from fastapi import HTTPException
 from typing import Optional, AsyncGenerator, Dict, Any
 from openai import AsyncOpenAI, AsyncAzureOpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai._exceptions import APIError, RateLimitError, AuthenticationError, BadRequestError
 from src.core.logging import logger
+
+_DATA_URL_RE = re.compile(r"data:[^;\"\\]+;base64,[A-Za-z0-9+/=]+")
+_MAX_LOGGED_REQUEST_CHARS = 4000
+
+
+def _bounded_request_params(request: Dict[str, Any]) -> str:
+    """Serialize a request for logging without base64 blobs or unbounded size."""
+    try:
+        params = json.dumps(request, ensure_ascii=False)
+    except (TypeError, ValueError):
+        params = repr(request)
+    params = _DATA_URL_RE.sub(
+        lambda match: f"data:...;base64,<{len(match.group(0))} chars omitted>", params
+    )
+    if len(params) > _MAX_LOGGED_REQUEST_CHARS:
+        params = (
+            params[:_MAX_LOGGED_REQUEST_CHARS]
+            + f"... <truncated, {len(params)} chars total>"
+        )
+    return params
+
 
 class OpenAIClient:
     """Async OpenAI client with cancellation support."""
@@ -48,21 +70,18 @@ class OpenAIClient:
         request: Dict[str, Any],
         request_id: Optional[str],
     ) -> None:
-        """Log the full exception chain and the upstream request parameters.
+        """Log the exception chain plus a bounded, redacted request summary.
 
         ``str(APIConnectionError)`` is only "Connection error.", so without
         the cause the log gives no hint about what actually failed
         (ConnectError, ReadError, RemoteProtocolError, ...).  The request
-        body is included because an upstream 400 (for example
-        ``{'code': '8001', 'msg': '模型不存在'}``) can only be traced back
-        to the payload that triggered it when its parameters are logged in
-        the same entry.
+        parameters are kept because an upstream 400 can only be traced back
+        to the payload that triggered it — but base64 image payloads are
+        redacted and the serialized body is truncated so a single failure
+        cannot write megabytes of conversation content into the log.
         """
         cause = error.__cause__
-        try:
-            params = json.dumps(request, ensure_ascii=False)
-        except (TypeError, ValueError):
-            params = repr(request)
+        params = _bounded_request_params(request)
         logger.error(
             "Upstream error: %s: %s (cause: %s: %s) | request_id=%s | request_params=%s",
             type(error).__name__,
@@ -128,15 +147,19 @@ class OpenAIClient:
             self._log_upstream_error(e, request, request_id)
             status_code = getattr(e, 'status_code', 500)
             raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
+        except HTTPException:
+            # Cancellation (499) and other internally raised HTTP errors must
+            # pass through unchanged, not be re-wrapped as a 500.
+            raise
         except Exception as e:
             self._log_upstream_error(e, request, request_id)
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-        
+
         finally:
             # Clean up active request tracking
             if request_id and request_id in self.active_requests:
                 del self.active_requests[request_id]
-    
+
     async def create_chat_completion_stream(self, request: Dict[str, Any], request_id: Optional[str] = None) -> AsyncGenerator[str, None]:
         """Send streaming chat completion to OpenAI API with cancellation support."""
         
@@ -182,10 +205,12 @@ class OpenAIClient:
             self._log_upstream_error(e, request, request_id)
             status_code = getattr(e, 'status_code', 500)
             raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
+        except HTTPException:
+            raise
         except Exception as e:
             self._log_upstream_error(e, request, request_id)
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-        
+
         finally:
             # Clean up active request tracking
             if request_id and request_id in self.active_requests:

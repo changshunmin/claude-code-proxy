@@ -2,7 +2,7 @@ import json
 import uuid
 from fastapi import HTTPException, Request
 from src.core.constants import Constants
-from src.core.errors import anthropic_error_body, prompt_too_long_message
+from src.core.errors import anthropic_error_body, anthropic_error_type, prompt_too_long_message
 from src.core.logging import claude_request_params
 from src.conversion.request_converter import estimate_claude_token_count
 from src.models.claude import ClaudeMessagesRequest
@@ -92,13 +92,11 @@ def convert_openai_to_claude_response(
         "content": content_blocks,
         "stop_reason": stop_reason,
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": max(prompt_tokens - cached_tokens, 0),
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": cached_tokens,
-            "output_tokens": usage.get("completion_tokens", 0),
-            "service_tier": "standard",
-        },
+        "usage": _claude_usage(
+            max(prompt_tokens - cached_tokens, 0),
+            cached_tokens,
+            usage.get("completion_tokens") or 0,
+        ),
     }
 
     if original_request.safeguards:
@@ -119,29 +117,27 @@ async def convert_openai_streaming_to_claude(
         yield chunk
 
 
+def _claude_usage(
+    input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
+    output_tokens: int = 0,
+) -> dict:
+    """Build the 5-key Anthropic usage object shared by every response path."""
+    return {
+        "input_tokens": input_tokens,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": cache_read_input_tokens,
+        "output_tokens": output_tokens,
+        "service_tier": "standard",
+    }
+
+
 def _map_stop_reason(finish_reason):
     if finish_reason == "length":
         return Constants.STOP_MAX_TOKENS
     if finish_reason in ("tool_calls", "function_call"):
         return Constants.STOP_TOOL_USE
     return Constants.STOP_END_TURN
-
-
-_HTTP_STATUS_TO_ANTHROPIC_ERROR = {
-    400: "invalid_request_error",
-    401: "authentication_error",
-    403: "permission_error",
-    404: "not_found_error",
-    413: "request_too_large",
-    429: "rate_limit_error",
-    500: "api_error",
-    529: "overloaded_error",
-}
-
-
-def _anthropic_error_type(status_code: int) -> str:
-    """Map an upstream HTTP status to an Anthropic stream error type."""
-    return _HTTP_STATUS_TO_ANTHROPIC_ERROR.get(status_code, "api_error")
 
 
 def _unsupported_safeguard_results(original_request: ClaudeMessagesRequest):
@@ -200,13 +196,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {
-                    "input_tokens": estimated_input_tokens,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                    "output_tokens": 0,
-                    "service_tier": "standard",
-                },
+                "usage": _claude_usage(estimated_input_tokens),
             },
         },
     )
@@ -220,13 +210,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     text_open = False
     current_tool_calls = {}
     final_stop_reason = Constants.STOP_END_TURN
-    usage_data = {
-        "input_tokens": estimated_input_tokens,
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0,
-        "output_tokens": 0,
-        "service_tier": "standard",
-    }
+    usage_data = _claude_usage(estimated_input_tokens)
 
     def start_thinking():
         nonlocal next_index, thinking_index
@@ -243,15 +227,17 @@ async def convert_openai_streaming_to_claude_with_cancellation(
         return text_index
 
     def close_thinking_events():
-        nonlocal thinking_open
+        nonlocal thinking_index, thinking_open
         if thinking_index is not None and thinking_open:
             thinking_open = False
+            index = thinking_index
+            thinking_index = None
             return [
                 sse(
                     Constants.EVENT_CONTENT_BLOCK_DELTA,
                     {
                         "type": Constants.EVENT_CONTENT_BLOCK_DELTA,
-                        "index": thinking_index,
+                        "index": index,
                         "delta": {
                             "type": Constants.DELTA_SIGNATURE,
                             "signature": message_id,
@@ -260,7 +246,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                 ),
                 sse(
                     Constants.EVENT_CONTENT_BLOCK_STOP,
-                    {"type": Constants.EVENT_CONTENT_BLOCK_STOP, "index": thinking_index},
+                    {"type": Constants.EVENT_CONTENT_BLOCK_STOP, "index": index},
                 ),
             ]
         return []
@@ -292,16 +278,15 @@ async def convert_openai_streaming_to_claude_with_cancellation(
             usage = chunk.get("usage")
             if usage:
                 prompt_details = usage.get("prompt_tokens_details") or {}
-                prompt_tokens = usage.get("prompt_tokens", 0)
-                cached_tokens = prompt_details.get("cached_tokens", 0)
+                # Explicit nulls must not blow up the subtraction mid-stream.
+                prompt_tokens = usage.get("prompt_tokens") or 0
+                cached_tokens = prompt_details.get("cached_tokens") or 0
                 # Anthropic 语义：input_tokens 不含缓存读取，而 prompt_tokens 已含
-                usage_data = {
-                    "input_tokens": max(prompt_tokens - cached_tokens, 0),
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": cached_tokens,
-                    "output_tokens": usage.get("completion_tokens", 0),
-                    "service_tier": "standard",
-                }
+                usage_data = _claude_usage(
+                    max(prompt_tokens - cached_tokens, 0),
+                    cached_tokens,
+                    usage.get("completion_tokens") or 0,
+                )
 
             choices = chunk.get("choices") or []
             if not choices:
@@ -313,6 +298,15 @@ async def convert_openai_streaming_to_claude_with_cancellation(
 
             reasoning_delta = delta.get("reasoning") or delta.get("reasoning_content")
             if reasoning_delta:
+                if text_open:
+                    # Keep a single block open at a time: reasoning arriving
+                    # after text needs the text block closed first.
+                    text_open = False
+                    yield sse(
+                        Constants.EVENT_CONTENT_BLOCK_STOP,
+                        {"type": Constants.EVENT_CONTENT_BLOCK_STOP, "index": text_index},
+                    )
+                    text_index = None
                 index = start_thinking()
                 if not thinking_open:
                     thinking_open = True
@@ -379,6 +373,9 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                             Constants.EVENT_CONTENT_BLOCK_STOP,
                             {"type": Constants.EVENT_CONTENT_BLOCK_STOP, "index": text_index},
                         )
+                        # Release the index: a later text delta needs a fresh
+                        # block instead of restarting an already-closed one.
+                        text_index = None
                     tool_call["index"] = next_index
                     next_index += 1
                     yield sse(
@@ -433,7 +430,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
         )
         yield sse(
             "error",
-            anthropic_error_body(str(e.detail), _anthropic_error_type(e.status_code)),
+            anthropic_error_body(str(e.detail), anthropic_error_type(e.status_code)),
         )
         return
     except Exception as e:

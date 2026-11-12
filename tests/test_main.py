@@ -117,8 +117,8 @@ async def test_with_system_message():
 async def test_multimodal():
     """Test multimodal input (text + image)."""
     async with httpx.AsyncClient(headers=AUTH_HEADERS) as client:
-        # Sample base64 image (1x1 pixel transparent PNG)
-        sample_image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChAI9jU8PJAAAAASUVORK5CYII="
+        # Sample base64 image (1x1 pixel transparent PNG, decodes cleanly)
+        sample_image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII="
         
         response = await client.post(
             f"{BASE_URL}/v1/messages",

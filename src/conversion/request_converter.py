@@ -29,6 +29,11 @@ def estimate_tokens(messages: List[Dict[str, Any]]) -> int:
         elif isinstance(content, list):
             for block in content:
                 if isinstance(block, dict):
+                    # Image payloads are base64, and the upstream bills them by
+                    # pixels rather than characters; counting the data URL as
+                    # text would collapse max_tokens to the minimum.
+                    if block.get("type") in ("image_url", "image"):
+                        continue
                     total += estimate_text_tokens(json.dumps(block, ensure_ascii=False))
     return total
 
@@ -221,28 +226,28 @@ def convert_claude_to_openai(
             # Already merged into the leading system message above.
             pass
         elif msg.role == Constants.ROLE_USER:
-            openai_message = convert_claude_user_message(msg)
-            openai_messages.append(openai_message)
+            # Tool results must follow their assistant tool_use turn upstream.
+            # Convert them wherever they appear instead of only when adjacent:
+            # CC can insert a role="system" metadata message in between.
+            has_tool_result = isinstance(msg.content, list) and any(
+                block.type == Constants.CONTENT_TOOL_RESULT for block in msg.content
+            )
+            if has_tool_result:
+                openai_messages.extend(convert_claude_tool_results(msg))
+            else:
+                openai_message = convert_claude_user_message(msg)
+                # Metadata-only blocks (e.g. tool_addition) leave nothing to send;
+                # an empty content array is rejected by OpenAI-compatible upstreams.
+                if openai_message["content"] != []:
+                    openai_messages.append(openai_message)
         elif msg.role == Constants.ROLE_ASSISTANT:
             openai_message = convert_claude_assistant_message(msg)
-            openai_messages.append(openai_message)
-
-            # Check if next message contains tool results
-            if i + 1 < len(claude_request.messages):
-                next_msg = claude_request.messages[i + 1]
-                if (
-                    next_msg.role == Constants.ROLE_USER
-                    and isinstance(next_msg.content, list)
-                    and any(
-                        block.type == Constants.CONTENT_TOOL_RESULT
-                        for block in next_msg.content
-                        if hasattr(block, "type")
-                    )
-                ):
-                    # Process tool results
-                    i += 1  # Skip to tool result message
-                    tool_results = convert_claude_tool_results(next_msg)
-                    openai_messages.extend(tool_results)
+            # An assistant turn with neither text nor tool calls is invalid
+            # upstream; it can appear when every block was metadata-only.
+            if openai_message.get("content") is not None or openai_message.get(
+                "tool_calls"
+            ):
+                openai_messages.append(openai_message)
 
         i += 1
 
@@ -287,8 +292,9 @@ def convert_claude_to_openai(
         if openai_tools:
             openai_request["tools"] = openai_tools
 
-    # Convert tool choice
-    if claude_request.tool_choice:
+    # Convert tool choice. Upstreams reject tool_choice unless tools is set,
+    # so only forward it when client tools actually made it into the request.
+    if claude_request.tool_choice and "tools" in openai_request:
         choice_type = claude_request.tool_choice.get("type")
         if choice_type == "auto":
             openai_request["tool_choice"] = "auto"
@@ -326,29 +332,9 @@ def convert_claude_user_message(msg: ClaudeMessage) -> Dict[str, Any]:
         if block.type == Constants.CONTENT_TEXT:
             openai_content.append({"type": "text", "text": block.text})
         elif block.type == Constants.CONTENT_IMAGE:
-            # Convert Claude image format to OpenAI format
-            if isinstance(block.source, dict) and block.source.get("type") == "url":
-                if block.source.get("url"):
-                    openai_content.append(
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": block.source["url"]},
-                        }
-                    )
-            elif (
-                isinstance(block.source, dict)
-                and block.source.get("type") == "base64"
-                and "media_type" in block.source
-                and "data" in block.source
-            ):
-                openai_content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{block.source['media_type']};base64,{block.source['data']}"
-                        },
-                    }
-                )
+            image_block = image_block_to_openai(block)
+            if image_block:
+                openai_content.append(image_block)
 
     if len(openai_content) == 1 and openai_content[0]["type"] == "text":
         return {"role": Constants.ROLE_USER, "content": openai_content[0]["text"]}

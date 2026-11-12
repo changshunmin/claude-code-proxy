@@ -54,3 +54,20 @@ def prompt_too_long_message(error_detail) -> Optional[str]:
 
 def anthropic_error_body(message: str, error_type: str = "invalid_request_error") -> dict:
     return {"type": "error", "error": {"type": error_type, "message": message}}
+
+
+_HTTP_STATUS_TO_ANTHROPIC_ERROR = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    429: "rate_limit_error",
+    500: "api_error",
+    529: "overloaded_error",
+}
+
+
+def anthropic_error_type(status_code: int) -> str:
+    """Map an upstream HTTP status to an Anthropic error type."""
+    return _HTTP_STATUS_TO_ANTHROPIC_ERROR.get(status_code, "api_error")

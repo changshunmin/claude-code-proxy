@@ -4,8 +4,8 @@ from fastapi.responses import JSONResponse
 from src.api.endpoints import router as api_router
 import uvicorn
 import sys
-import json
 from src.core.config import config
+from src.core.errors import anthropic_error_body
 from src.core.logging import logger
 
 app = FastAPI(title="Claude-to-OpenAI API Proxy", version="1.0.0")
@@ -30,26 +30,23 @@ async def validation_exception_handler(
     except Exception:
         raw_body = "<unreadable>"
     errors = exc.errors()
-    logger.error(
-        "Request validation failed: %s %s errors=%s body=%s",
-        request.method,
-        request.url,
-        json.dumps(errors, ensure_ascii=False, default=str),
-        raw_body[:8000],
-    )
     messages = []
     for err in errors:
         loc = ".".join(str(part) for part in err.get("loc", []))
         messages.append(f"{loc}: {err.get('msg', 'invalid value')}")
+    summary = "; ".join(messages)
+    # Pydantic errors embed the offending `input` subtree, which can be a
+    # multi-megabyte base64 image; log locations/messages only, bounded.
+    logger.error(
+        "Request validation failed: %s %s errors=%s body=%s",
+        request.method,
+        request.url,
+        summary[:2000],
+        raw_body[:8000],
+    )
     return JSONResponse(
         status_code=400,
-        content={
-            "type": "error",
-            "error": {
-                "type": "invalid_request_error",
-                "message": "Invalid request: " + "; ".join(messages),
-            },
-        },
+        content=anthropic_error_body("Invalid request: " + summary[:4000]),
     )
 
 

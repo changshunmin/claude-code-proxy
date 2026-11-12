@@ -3,6 +3,9 @@
 import base64
 import logging
 
+import pytest
+from pydantic import ValidationError
+
 from src.core.model_manager import model_manager
 
 from src.conversion.request_converter import (
@@ -10,6 +13,7 @@ from src.conversion.request_converter import (
     convert_claude_tool_results,
     estimate_claude_token_count,
     estimate_text_tokens,
+    estimate_tokens,
 )
 from src.models.claude import ClaudeMessage, ClaudeMessagesRequest
 
@@ -142,6 +146,25 @@ def test_tool_choice_specific_function_is_preserved():
     }
 
 
+def test_tool_choice_without_tools_is_not_forwarded():
+    # OpenAI-compatible upstreams reject tool_choice when tools is absent.
+    out = convert_claude_to_openai(_request(tool_choice={"type": "auto"}), model_manager)
+    assert "tools" not in out
+    assert "tool_choice" not in out
+
+
+def test_tool_choice_with_only_server_tools_is_not_forwarded():
+    out = convert_claude_to_openai(
+        _request(
+            tool_choice={"type": "auto"},
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+        ),
+        model_manager,
+    )
+    assert "tools" not in out
+    assert "tool_choice" not in out
+
+
 # --- debug logging -----------------------------------------------------------
 
 def test_debug_log_includes_tools_and_tool_choice(caplog):
@@ -193,6 +216,22 @@ def test_server_tools_are_skipped_not_failing():
     assert [t["function"]["name"] for t in out["tools"]] == ["Bash"]
 
 
+def test_base64_image_without_media_type_defaults_to_png():
+    from src.conversion.request_converter import convert_claude_user_message
+
+    msg = ClaudeMessage(
+        role="user",
+        content=[{"type": "image", "source": {"type": "base64", "data": B64}}],
+    )
+    converted = convert_claude_user_message(msg)
+    assert converted["content"] == [
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{B64}"},
+        }
+    ]
+
+
 def test_url_image_is_passed_through_as_image_url():
     from src.conversion.request_converter import convert_claude_user_message
 
@@ -228,6 +267,49 @@ def test_text_after_tool_result_is_preserved():
     messages = convert_claude_tool_results(msg)
     assert messages[0]["role"] == "tool"
     assert messages[1] == {"role": "user", "content": "and then?"}
+
+
+def test_estimate_tokens_ignores_base64_image_payload():
+    huge = "A" * 2_000_000
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe this"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{huge}"},
+                },
+            ],
+        }
+    ]
+    assert estimate_tokens(messages) < 1000
+
+
+def test_huge_base64_image_does_not_collapse_max_tokens():
+    huge = "A" * 2_000_000
+    req = ClaudeMessagesRequest(
+        model="deepseek-flash",
+        max_tokens=64000,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": huge,
+                        },
+                    },
+                    {"type": "text", "text": "describe this"},
+                ],
+            }
+        ],
+    )
+    out = convert_claude_to_openai(req, model_manager)
+    assert out["max_tokens"] > model_manager.config.min_tokens_limit
 
 
 def test_count_tokens_ignores_base64_image_payload():
@@ -316,3 +398,182 @@ def test_system_role_message_ignores_non_text_blocks():
 
     converted = convert_claude_to_openai(req, model_manager)
     assert converted["messages"][0]["content"] == "KEEP"
+
+
+def test_unknown_content_block_type_is_accepted_and_dropped():
+    """Claude Code keeps adding metadata block types (tool_removal, ...).
+    The model layer must accept them and the converter must drop them."""
+    req = _request(
+        messages=[
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "gone"},
+                    {
+                        "type": "tool_removal",
+                        "tool": {"type": "tool_reference", "name": "X"},
+                    },
+                ],
+            },
+            {"role": "user", "content": "hi"},
+        ]
+    )
+
+    converted = convert_claude_to_openai(req, model_manager)
+    assert converted["messages"][0]["content"] == "gone"
+    assert [m["role"] for m in converted["messages"][1:]] == ["user"]
+
+
+def test_unknown_block_without_text_is_not_forwarded():
+    req = _request(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_removal", "tool": {"type": "tool_reference"}}
+                ],
+            },
+            {"role": "user", "content": "hi"},
+        ]
+    )
+
+    converted = convert_claude_to_openai(req, model_manager)
+    assert [m["content"] for m in converted["messages"]] == ["hi"]
+
+
+def test_malformed_known_block_still_fails_validation():
+    # The catch-all must not mask errors in block types we understand.
+    with pytest.raises(ValidationError):
+        _request(messages=[{"role": "user", "content": [{"type": "text"}]}])
+
+
+def test_tool_result_after_interleaved_system_message_is_kept():
+    """CC 2.1.x can insert a role="system" metadata message between a
+    tool_use turn and its tool_result. The pair must stay adjacent after
+    conversion or the upstream drops/rejects the tool output."""
+    req = ClaudeMessagesRequest(
+        model="deepseek-flash",
+        max_tokens=128,
+        messages=[
+            ClaudeMessage(role="user", content="hi"),
+            ClaudeMessage(
+                role="assistant",
+                content=[
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}
+                ],
+            ),
+            ClaudeMessage(
+                role="system",
+                content=[
+                    {"type": "text", "text": "hook"},
+                    {
+                        "type": "tool_addition",
+                        "tool": {"type": "tool_reference", "name": "X"},
+                    },
+                ],
+            ),
+            ClaudeMessage(
+                role="user",
+                content=[
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "ok",
+                    }
+                ],
+            ),
+        ],
+    )
+
+    converted = convert_claude_to_openai(req, model_manager)
+    roles = [m["role"] for m in converted["messages"]]
+    assert roles == ["system", "user", "assistant", "tool"]
+    assert converted["messages"][3] == {
+        "role": "tool",
+        "tool_call_id": "toolu_1",
+        "content": "ok",
+    }
+
+
+def test_tool_addition_only_user_message_is_not_forwarded():
+    """A metadata-only block leaves no content; an empty OpenAI message would
+    make the upstream reject the whole request."""
+    req = ClaudeMessagesRequest(
+        model="deepseek-flash",
+        max_tokens=128,
+        messages=[
+            ClaudeMessage(
+                role="user",
+                content=[
+                    {
+                        "type": "tool_addition",
+                        "tool": {"type": "tool_reference", "name": "X"},
+                    }
+                ],
+            ),
+            ClaudeMessage(role="user", content="hi"),
+        ],
+    )
+
+    converted = convert_claude_to_openai(req, model_manager)
+    assert [m["content"] for m in converted["messages"]] == ["hi"]
+
+
+def test_assistant_message_with_only_tool_addition_is_not_forwarded():
+    req = ClaudeMessagesRequest(
+        model="deepseek-flash",
+        max_tokens=128,
+        messages=[
+            ClaudeMessage(role="user", content="hi"),
+            ClaudeMessage(
+                role="assistant",
+                content=[
+                    {
+                        "type": "tool_addition",
+                        "tool": {"type": "tool_reference", "name": "X"},
+                    }
+                ],
+            ),
+            ClaudeMessage(role="user", content="again"),
+        ],
+    )
+
+    converted = convert_claude_to_openai(req, model_manager)
+    assert [m["role"] for m in converted["messages"]] == ["user", "user"]
+
+
+def test_tool_addition_block_is_accepted_and_ignored():
+    """Claude Code 2.1.x announces deferred tools with ``tool_addition``
+    blocks. They are client-side metadata, so the request must validate and
+    conversion keeps the accompanying text while dropping the block."""
+    req = ClaudeMessagesRequest(
+        model="deepseek-flash",
+        max_tokens=128,
+        messages=[
+            ClaudeMessage(
+                role="user",
+                content=[
+                    {
+                        "type": "text",
+                        "text": "The following tools just became available and are ready to use:\nSubagentHandback",
+                    },
+                    {
+                        "type": "tool_addition",
+                        "tool": {
+                            "type": "tool_reference",
+                            "name": "SubagentHandback",
+                        },
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ],
+            )
+        ],
+    )
+
+    converted = convert_claude_to_openai(req, model_manager)
+    assert converted["messages"] == [
+        {
+            "role": "user",
+            "content": "The following tools just became available and are ready to use:\nSubagentHandback",
+        }
+    ]
