@@ -1,3 +1,4 @@
+import json
 import logging
 from src.core.config import config
 
@@ -15,6 +16,25 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger(__name__)
+
+
+def claude_request_params(request) -> str:
+    """Compact client request parameters for error log entries."""
+    return json.dumps(
+        {
+            "model": getattr(request, "model", None),
+            "stream": getattr(request, "stream", None),
+            "max_tokens": getattr(request, "max_tokens", None),
+            "temperature": getattr(request, "temperature", None),
+            "message_count": len(getattr(request, "messages", None) or []),
+            "tools": [
+                tool.name for tool in (getattr(request, "tools", None) or [])
+            ],
+            "tool_choice": getattr(request, "tool_choice", None),
+        },
+        ensure_ascii=False,
+    )
+
 
 # Configure uvicorn to be quieter
 for uvicorn_logger in ["uvicorn", "uvicorn.access", "uvicorn.error"]:

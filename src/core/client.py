@@ -42,20 +42,35 @@ class OpenAIClient:
             )
         self.active_requests: Dict[str, asyncio.Event] = {}
 
-    def _log_upstream_error(self, error: Exception) -> None:
-        """Log the full exception chain.
+    def _log_upstream_error(
+        self,
+        error: Exception,
+        request: Dict[str, Any],
+        request_id: Optional[str],
+    ) -> None:
+        """Log the full exception chain and the upstream request parameters.
 
         ``str(APIConnectionError)`` is only "Connection error.", so without
         the cause the log gives no hint about what actually failed
-        (ConnectError, ReadError, RemoteProtocolError, ...).
+        (ConnectError, ReadError, RemoteProtocolError, ...).  The request
+        body is included because an upstream 400 (for example
+        ``{'code': '8001', 'msg': '模型不存在'}``) can only be traced back
+        to the payload that triggered it when its parameters are logged in
+        the same entry.
         """
         cause = error.__cause__
+        try:
+            params = json.dumps(request, ensure_ascii=False)
+        except (TypeError, ValueError):
+            params = repr(request)
         logger.error(
-            "Upstream error: %s: %s (cause: %s: %s)",
+            "Upstream error: %s: %s (cause: %s: %s) | request_id=%s | request_params=%s",
             type(error).__name__,
             error,
             type(cause).__name__ if cause is not None else "none",
             cause if cause is not None else "",
+            request_id or "none",
+            params,
         )
 
     async def create_chat_completion(self, request: Dict[str, Any], request_id: Optional[str] = None) -> Dict[str, Any]:
@@ -101,20 +116,20 @@ class OpenAIClient:
             return completion.model_dump()
         
         except AuthenticationError as e:
-            self._log_upstream_error(e)
+            self._log_upstream_error(e, request, request_id)
             raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
-            self._log_upstream_error(e)
+            self._log_upstream_error(e, request, request_id)
             raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
         except BadRequestError as e:
-            self._log_upstream_error(e)
+            self._log_upstream_error(e, request, request_id)
             raise HTTPException(status_code=400, detail=self.classify_openai_error(str(e)))
         except APIError as e:
-            self._log_upstream_error(e)
+            self._log_upstream_error(e, request, request_id)
             status_code = getattr(e, 'status_code', 500)
             raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
         except Exception as e:
-            self._log_upstream_error(e)
+            self._log_upstream_error(e, request, request_id)
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
         
         finally:
@@ -155,20 +170,20 @@ class OpenAIClient:
             yield "data: [DONE]"
                 
         except AuthenticationError as e:
-            self._log_upstream_error(e)
+            self._log_upstream_error(e, request, request_id)
             raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
-            self._log_upstream_error(e)
+            self._log_upstream_error(e, request, request_id)
             raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
         except BadRequestError as e:
-            self._log_upstream_error(e)
+            self._log_upstream_error(e, request, request_id)
             raise HTTPException(status_code=400, detail=self.classify_openai_error(str(e)))
         except APIError as e:
-            self._log_upstream_error(e)
+            self._log_upstream_error(e, request, request_id)
             status_code = getattr(e, 'status_code', 500)
             raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
         except Exception as e:
-            self._log_upstream_error(e)
+            self._log_upstream_error(e, request, request_id)
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
         
         finally:

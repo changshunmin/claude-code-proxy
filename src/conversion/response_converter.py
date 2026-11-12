@@ -3,6 +3,7 @@ import uuid
 from fastapi import HTTPException, Request
 from src.core.constants import Constants
 from src.core.errors import anthropic_error_body, prompt_too_long_message
+from src.core.logging import claude_request_params
 from src.conversion.request_converter import estimate_claude_token_count
 from src.models.claude import ClaudeMessagesRequest
 
@@ -426,7 +427,10 @@ async def convert_openai_streaming_to_claude_with_cancellation(
         # sent. Report the failure inside the stream instead of raising, which
         # would make Starlette log "Caught handled exception, but response
         # already started." and leave the client with a silent truncation.
-        logger.error(f"Upstream streaming error {e.status_code}: {e.detail}")
+        logger.error(
+            f"Upstream streaming error {e.status_code}: {e.detail} | "
+            f"request_params={claude_request_params(original_request)}"
+        )
         yield sse(
             "error",
             anthropic_error_body(str(e.detail), _anthropic_error_type(e.status_code)),
@@ -438,7 +442,10 @@ async def convert_openai_streaming_to_claude_with_cancellation(
             logger.warning(f"Upstream context overflow: {overflow_message}")
             yield sse("error", anthropic_error_body(overflow_message))
             return
-        logger.error(f"Streaming error: {e}")
+        logger.error(
+            f"Streaming error: {e} | "
+            f"request_params={claude_request_params(original_request)}"
+        )
         import traceback
 
         logger.error(traceback.format_exc())

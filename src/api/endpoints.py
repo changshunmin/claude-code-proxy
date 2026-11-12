@@ -5,7 +5,7 @@ import uuid
 from typing import Optional
 
 from src.core.config import config
-from src.core.logging import logger
+from src.core.logging import claude_request_params, logger
 from src.core.client import OpenAIClient
 from src.core.errors import anthropic_error_body, prompt_too_long_message
 from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
@@ -102,7 +102,10 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                 )
             except HTTPException as e:
                 # Convert to proper error response for streaming
-                logger.error(f"Streaming error: {e.detail}")
+                logger.error(
+                    f"Streaming error: {e.detail} | "
+                    f"request_params={claude_request_params(request)}"
+                )
                 import traceback
 
                 logger.error(traceback.format_exc())
@@ -132,7 +135,10 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
     except Exception as e:
         import traceback
 
-        logger.error(f"Unexpected error processing request: {e}")
+        logger.error(
+            f"Unexpected error processing request: {e} | "
+            f"request_params={claude_request_params(request)}"
+        )
         logger.error(traceback.format_exc())
         overflow_message = prompt_too_long_message(e)
         if overflow_message:
@@ -152,7 +158,10 @@ async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(valid
         return {"input_tokens": estimated_tokens}
 
     except Exception as e:
-        logger.error(f"Error counting tokens: {e}")
+        logger.error(
+            f"Error counting tokens: {e} | "
+            f"request_params={claude_request_params(request)}"
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 
